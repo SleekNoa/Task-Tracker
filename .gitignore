@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+
+timer_state.json
+
+*.png
+
+.vscode/
+.idea/
+
+.DS_Store
+Thumbs.db
