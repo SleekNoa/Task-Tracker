@@ -1,10 +1,11 @@
 """
 Task Tracker SPA - Single Page Application with Persistent Timer
-Timer continues even when navigating away from the page.
+Refactored to use application services.
 """
 
 import json
 import os
+import sys
 from datetime import datetime
 from collections import defaultdict
 import webbrowser
@@ -12,8 +13,21 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import time
 
-DATA_FILE = "tasks.json"
+# Add current directory to path for imports
+sys.path.insert(0, os.getcwd())
+
+from app.services.task_service import TaskService
+from app.services.timer_service import TimerService
+from app.services.report_service import ReportService
+from app.config import TASKS_FILE
+
 PORT = 8765
+
+# Initialize services
+task_service = TaskService()
+timer_service = TimerService()
+report_service = ReportService()
+
 
 class TaskHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -42,19 +56,6 @@ class TaskHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
     
-    def load_tasks(self):
-        if os.path.exists(DATA_FILE):
-            try:
-                with open(DATA_FILE, 'r') as f:
-                    return json.load(f)
-            except:
-                return []
-        return []
-    
-    def save_tasks(self, tasks):
-        with open(DATA_FILE, 'w') as f:
-            json.dump(tasks, f, indent=2)
-    
     def handle_add_task(self):
         content_length = int(self.headers['Content-Length'])
         post_data = self.rfile.read(content_length)
@@ -62,7 +63,12 @@ class TaskHandler(BaseHTTPRequestHandler):
         
         task_text = data.get('task', '').strip()
         if task_text:
-            tasks = self.load_tasks()
+            # Use service to get/create task, then record to tasks.json for backward compatibility
+            task_service.get_or_create_task(task_text)
+            
+            # Record to tasks.json for backward compatibility
+            from app.storage.json_storage import JSONStorage
+            storage = JSONStorage(TASKS_FILE)
             entry = {
                 "timestamp": datetime.now().isoformat(),
                 "date": datetime.now().strftime("%Y-%m-%d"),
@@ -71,8 +77,7 @@ class TaskHandler(BaseHTTPRequestHandler):
                 "duration_minutes": 60,
                 "type": "hourly"
             }
-            tasks.append(entry)
-            self.save_tasks(tasks)
+            storage.append(entry)
         
         self.send_json_response({"status": "ok"})
     
@@ -83,58 +88,24 @@ class TaskHandler(BaseHTTPRequestHandler):
         
         task_text = data.get('task', '').strip()
         if task_text:
-            # Save timer start to file
-            timer_data = {
-                "task": task_text,
-                "start_time": time.time(),
-                "active": True
-            }
-            with open("timer_state.json", 'w') as f:
-                json.dump(timer_data, f)
+            timer_service.start(task_text)
         
         self.send_json_response({"status": "ok", "active_task": task_text})
     
     def handle_stop_task(self):
-        if os.path.exists("timer_state.json"):
-            with open("timer_state.json", 'r') as f:
-                timer_data = json.load(f)
-            
-            if timer_data.get("active"):
-                start_time = timer_data.get("start_time", time.time())
-                elapsed_seconds = time.time() - start_time
-                elapsed_minutes = max(1, round(elapsed_seconds / 60))
-                
-                tasks = self.load_tasks()
-                entry = {
-                    "timestamp": datetime.now().isoformat(),
-                    "date": datetime.now().strftime("%Y-%m-%d"),
-                    "time": datetime.now().strftime("%H:%M"),
-                    "task": timer_data.get("task", "Unknown"),
-                    "duration_minutes": elapsed_minutes,
-                    "type": "timed"
-                }
-                tasks.append(entry)
-                self.save_tasks(tasks)
-                
-                # Clear timer state
-                os.remove("timer_state.json")
+        session = timer_service.stop()
         
         self.send_json_response({"status": "ok"})
     
     def handle_check_timer(self):
-        if os.path.exists("timer_state.json"):
-            with open("timer_state.json", 'r') as f:
-                timer_data = json.load(f)
-            
-            if timer_data.get("active"):
-                elapsed_seconds = time.time() - timer_data.get("start_time", time.time())
-                self.send_json_response({
-                    "active": True,
-                    "task": timer_data.get("task"),
-                    "elapsed_seconds": elapsed_seconds
-                })
-            else:
-                self.send_json_response({"active": False})
+        timer = timer_service.get_active()
+        if timer:
+            elapsed_seconds = timer.get_elapsed_seconds()
+            self.send_json_response({
+                "active": True,
+                "task": timer.task_id,
+                "elapsed_seconds": elapsed_seconds
+            })
         else:
             self.send_json_response({"active": False})
     
@@ -213,7 +184,6 @@ class TaskHandler(BaseHTTPRequestHandler):
         let startTime = null;
         let activeTask = null;
         
-        // Check for existing timer on page load
         async function checkTimer() {
             const response = await fetch('/api/check-timer');
             const data = await response.json();
@@ -251,7 +221,7 @@ class TaskHandler(BaseHTTPRequestHandler):
         }
         
         async function stopTimedTask() {
-            const response = await fetch('/api/stop-task', {
+            await fetch('/api/stop-task', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'}
             });
@@ -304,7 +274,6 @@ class TaskHandler(BaseHTTPRequestHandler):
             }
         }
         
-        // Initialize
         checkTimer();
         loadTasks();
         
@@ -414,37 +383,22 @@ class TaskHandler(BaseHTTPRequestHandler):
         self.send_html_response(html)
     
     def serve_tasks_json(self):
-        tasks = self.load_tasks()
+        from app.storage.json_storage import JSONStorage
+        tasks = JSONStorage(TASKS_FILE).read()
         self.send_json_response(tasks)
     
     def serve_summary_json(self):
-        tasks = self.load_tasks()
-        today = datetime.now().strftime("%Y-%m-%d")
-        daily_tasks = [t for t in tasks if t.get("date") == today]
-        
-        task_totals = defaultdict(lambda: {"count": 0, "total_minutes": 0})
-        for task in daily_tasks:
-            task_totals[task["task"]]["count"] += 1
-            task_totals[task["task"]]["total_minutes"] += task.get("duration_minutes", 60)
-        
-        total_minutes = sum(v["total_minutes"] for v in task_totals.values())
-        
-        summary = {
-            "date": today,
-            "total_tasks": len(task_totals),
-            "total_time_minutes": total_minutes,
-            "total_hours": round(total_minutes / 60, 1),
-            "tasks": [{"task": k, "total_minutes": v["total_minutes"], "hours": round(v["total_minutes"]/60, 1)} for k, v in task_totals.items()]
-        }
-        
+        summary = report_service.get_daily_summary()
         self.send_json_response([summary])
     
     def log_message(self, format, *args):
         pass
 
+
 def run_server():
     server = HTTPServer(('localhost', PORT), TaskHandler)
     server.serve_forever()
+
 
 def main():
     server_thread = threading.Thread(target=run_server, daemon=True)
@@ -468,6 +422,7 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nGoodbye!")
+
 
 if __name__ == "__main__":
     main()
